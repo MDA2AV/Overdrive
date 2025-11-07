@@ -68,3 +68,7 @@ unsigned shim_cqe_buffer_id(const struct io_uring_cqe* cqe) {
 void shim_prep_send(struct io_uring_sqe* sqe, int fd, const void* buf, unsigned nbytes, int flags) {
     io_uring_prep_send(sqe, fd, buf, nbytes, flags);
 }
+
+int shim_get_ring_fd(struct io_uring* ring) {
+    return ring->ring_fd;
+}
