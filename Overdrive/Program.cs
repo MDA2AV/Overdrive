@@ -1,68 +1,54 @@
-﻿// Program.cs — Multi-threaded io_uring /pp server (multishot accept + multishot recv + buf-ring)
-// Listens on 0.0.0.0:8080. Workers = WORKERS env (default: Environment.ProcessorCount).
-// Enable SQPOLL: SQPOLL=1 (needs CAP_SYS_ADMIN/root). Requires liburingshim.so next to the binary.
+﻿// Program.cs — io_uring /pp server: SQPOLL + multishot accept + single-shot recv (no buf-ring)
+// Requires: liburingshim.so on loader path (LD_LIBRARY_PATH=. or next to binary)
+// Run: SQPOLL=1 ./Overdrive   (needs CAP_SYS_ADMIN/root for SQPOLL)
 
+using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using static Overdrive.Native;
 
 unsafe class Program
 {
-    // ---- Affinity ----
-    static class Affinity
-    {
-        const long SYS_gettid = 186;
-        [DllImport("libc")] static extern long syscall(long n);
-        [DllImport("libc")] static extern int sched_setaffinity(int pid, nuint cpusetsize, byte[] mask);
-        public static void PinCurrentThreadToCpu(int cpu)
-        {
-            int tid = (int)syscall(SYS_gettid);
-            int bytes = (Environment.ProcessorCount + 7) / 8;
-            var mask = new byte[Math.Max(bytes, 8)];
-            mask[cpu/8] |= (byte)(1 << (cpu%8));
-            _ = sched_setaffinity(tid, (nuint)mask.Length, mask);
-        }
-    }
-
-    // ---- Unmanaged OK buffer (shared) ----
+    // ---- Prebuilt OK response ----
     static byte* OK_PTR; static nuint OK_LEN;
     static void InitOk()
     {
-        var s = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nContent-Type: text/plain\r\n\r\nOK";
+        const string s = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nContent-Type: text/plain\r\n\r\nOK";
         var a = Encoding.ASCII.GetBytes(s);
         OK_LEN = (nuint)a.Length;
-        OK_PTR = (byte*)NativeMemory.Alloc(OK_LEN);
-        for (int i=0;i<a.Length;i++) OK_PTR[i]=a[i];
+        OK_PTR = (byte*)NativeMemory.Alloc((nuint)a.Length);
+        for (int i = 0; i < a.Length; i++) OK_PTR[i] = a[i];
     }
 
-    // ---- helpers (no captures) ----
-    static int ParseOne(byte* pbuf, int len)
+    static int ParseOne(byte* p, int len)
     {
-        for (int i=3;i<len;i++)
-            if (pbuf[i-3]=='\r' && pbuf[i-2]=='\n' && pbuf[i-1]=='\r' && pbuf[i]=='\n')
-                return i+1;
+        for (int i = 3; i < len; i++)
+            if (p[i - 3] == '\r' && p[i - 2] == '\n' && p[i - 1] == '\r' && p[i] == '\n')
+                return i + 1;
         return 0;
     }
 
-    static io_uring_sqe* SqeGet(io_uring* pring)
+    static io_uring_sqe* SqeGet(IntPtr ring)
     {
-        var sqe = shim_get_sqe(pring);
-        if (sqe == null) { shim_submit(pring); sqe = shim_get_sqe(pring); }
+        var sqe = shim_get_sqe_h(ring);
+        if (sqe == null) { shim_submit_h(ring); sqe = shim_get_sqe_h(ring); }
         return sqe;
     }
 
-    static void SubmitSend(io_uring* pring, int fd, byte* buf, nuint off, nuint len)
+    static void SubmitSend(IntPtr ring, int fd, byte* buf, nuint off, nuint len)
     {
-        var sqe = SqeGet(pring);
+        var sqe = SqeGet(ring);
         shim_prep_send(sqe, fd, buf + off, (uint)(len - off), 0);
         shim_sqe_set_data64(sqe, PackUd(UdKind.Send, fd));
     }
 
-    static void ArmRecvMultishot(io_uring* pring, int fd, uint bgid)
+    static void ArmRecvSingle(IntPtr ring, int fd, byte* buf, uint len)
     {
-        var sqe = SqeGet(pring);
-        shim_prep_recv_multishot_select(sqe, fd, bgid, 0);
+        var sqe = SqeGet(ring);
+        shim_prep_recv(sqe, fd, buf, len, 0);
         shim_sqe_set_data64(sqe, PackUd(UdKind.Recv, fd));
+        shim_submit_h(ring); // flush now
     }
 
     static int CreateListen(string ip, ushort port)
@@ -73,7 +59,7 @@ unsafe class Program
         setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &one, (uint)sizeof(int));
         sockaddr_in addr = default;
         addr.sin_family = (ushort)AF_INET;
-        addr.sin_port   = Htons(port);
+        addr.sin_port = Htons(port);
         var ipb = Encoding.ASCII.GetBytes(ip + "\0");
         fixed (byte* pip = ipb) inet_pton(AF_INET, (sbyte*)pip, &addr.sin_addr);
         bind(lfd, &addr, (uint)sizeof(sockaddr_in));
@@ -85,10 +71,9 @@ unsafe class Program
     sealed class Conn
     {
         public int Fd;
-        public bool Sending;
         public nuint OutOff, OutLen;
         public byte* OutBuf;
-        public Conn(int fd){ Fd=fd; }
+        public Conn(int fd) { Fd = fd; }
     }
 
     static volatile bool StopAll = false;
@@ -97,56 +82,30 @@ unsafe class Program
     {
         public static void Run(string ip, ushort port, int workerIndex)
         {
-            //Affinity.PinCurrentThreadToCpu(workerIndex % Math.Max(1, Environment.ProcessorCount));
-
-            // Per-worker state
             Conn?[] Conns = new Conn?[MAX_FD];
 
-            // Allocate unmanaged ring + params (no fixed, no captures)
-            io_uring* pring   = (io_uring*)NativeMemory.Alloc((nuint)sizeof(io_uring));
-            io_uring_params* pprm = (io_uring_params*)NativeMemory.Alloc((nuint)sizeof(io_uring_params));
-            *pring = default;
-            *pprm  = default;
-
-            // Optional SQPOLL + coop + single-issuer via env
-            if (Environment.GetEnvironmentVariable("SQPOLL") == "1")
+            // Create ring (SQPOLL honor via shim + env)
+            const uint ENTRIES = 256;
+            int err;
+            IntPtr ring = shim_ring_create(ENTRIES, 2000, out err);
+            if (ring == IntPtr.Zero)
             {
-                pprm->flags = (1u<<3) /*SQPOLL*/ | (1u<<8) /*COOP_TASKRUN*/ | (1u<<12) /*SINGLE_ISSUER*/;
-                pprm->sq_thread_idle = 2000;
-                // pprm->sq_thread_cpu = (uint)(workerIndex % Math.Max(1, Environment.ProcessorCount));
+                Console.Error.WriteLine($"shim_ring_create failed: {err}");
+                return;
             }
+            Console.WriteLine($"SQPOLL ring ok, fd={shim_ring_fd(ring)}");
 
             int lfd = CreateListen(ip, port);
-            int q = shim_queue_init_params((uint)RING_ENTRIES, pring, pprm);
-            if (q < 0) { Console.Error.WriteLine($"[w{workerIndex}] queue_init_params: {q}"); return; }
 
-            // Buf-ring (per worker)
-            io_uring_buf_ring* BR;
-            byte* BR_Slab;
-            uint  BR_Mask;
-            uint  BR_Idx = 0;
-
-            {
-                int ret;
-                BR = shim_setup_buf_ring(pring, (uint)BR_ENTRIES, BR_GID, 0, out ret);
-                if (BR == null || ret < 0) throw new Exception($"setup_buf_ring failed: ret={ret}, ptr={(nint)BR}");
-                BR_Mask = (uint)(BR_ENTRIES - 1);
-                nuint slabSize = (nuint)(BR_ENTRIES * RECV_BUF_SZ);
-                BR_Slab = (byte*)NativeMemory.AlignedAlloc(slabSize, 64);
-                for (ushort bid=0; bid<BR_ENTRIES; bid++)
-                {
-                    byte* addr = BR_Slab + (nuint)bid * (nuint)RECV_BUF_SZ;
-                    shim_buf_ring_add(BR, addr, (uint)RECV_BUF_SZ, bid, (ushort)BR_Mask, BR_Idx++);
-                }
-                shim_buf_ring_advance(BR, (uint)BR_ENTRIES);
-            }
+            // One worker-wide recv buffer (8 KiB)
+            byte* RECV = (byte*)NativeMemory.AlignedAlloc((nuint)RECV_BUF_SZ, 64);
 
             // Multishot accept
             {
-                var sqe = SqeGet(pring);
+                var sqe = SqeGet(ring);
                 shim_prep_multishot_accept(sqe, lfd, SOCK_NONBLOCK);
                 shim_sqe_set_data64(sqe, PackUd(UdKind.Accept, lfd));
-                shim_submit(pring);
+                shim_submit_h(ring);
             }
 
             var cqes = new io_uring_cqe*[BATCH_CQES];
@@ -156,21 +115,21 @@ unsafe class Program
             {
                 int got;
                 fixed (io_uring_cqe** pC = cqes)
-                    got = shim_peek_batch_cqe(pring, pC, (uint)BATCH_CQES);
+                    got = shim_peek_batch_cqe_h(ring, pC, (uint)BATCH_CQES);
 
                 if (got <= 0)
                 {
                     io_uring_cqe* oneCqe = null;
-                    if (shim_wait_cqe(pring, &oneCqe) != 0) continue;
+                    if (shim_wait_cqe_h(ring, &oneCqe) != 0) continue;
                     cqes[0] = oneCqe; got = 1;
                 }
 
-                for (int i=0;i<got;i++)
+                for (int i = 0; i < got; i++)
                 {
                     var cqe = cqes[i];
                     ulong ud = shim_cqe_get_data64(cqe);
                     var kind = UdKindOf(ud);
-                    int res  = cqe->res;
+                    int res = cqe->res;
 
                     if (kind == UdKind.Accept)
                     {
@@ -178,9 +137,9 @@ unsafe class Program
                         {
                             int fd = res;
                             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, (uint)sizeof(int));
-                            var c = Conns[fd]; if (c is null) Conns[fd] = c = new Conn(fd);
-                            c.Sending=false; c.OutBuf=null; c.OutOff=0; c.OutLen=0;
-                            ArmRecvMultishot(pring, fd, BR_GID);
+                            Conns[fd] = new Conn(fd);
+                            // arm first recv for this connection immediately
+                            ArmRecvSingle(ring, fd, RECV, (uint)RECV_BUF_SZ);
                         }
                     }
                     else if (kind == UdKind.Recv)
@@ -188,33 +147,26 @@ unsafe class Program
                         int fd = UdFdOf(ud);
                         if (res <= 0)
                         {
-                            var c = Conns[fd];
-                            if (c is not null) { Conns[fd]=null; close(fd); }
+                            if (Conns[fd] is not null) Conns[fd] = null;
+                            close(fd);
                         }
                         else
                         {
-                            ushort bid = 0;
-                            if (shim_cqe_has_buffer(cqe) != 0) bid = (ushort)shim_cqe_buffer_id(cqe);
-                            byte* basePtr = BR_Slab + (nuint)bid * (nuint)RECV_BUF_SZ;
-
                             var c = Conns[fd];
                             if (c is not null)
                             {
                                 int usedTotal = 0;
                                 while (true)
                                 {
-                                    int used = ParseOne(basePtr + usedTotal, res - usedTotal);
+                                    int used = ParseOne(RECV + usedTotal, res - usedTotal);
                                     if (used <= 0) break;
                                     usedTotal += used;
                                     c.OutBuf = OK_PTR; c.OutLen = OK_LEN; c.OutOff = 0;
-                                    SubmitSend(pring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
+                                    SubmitSend(ring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
                                 }
+                                // re-arm recv for next request(s)
+                                ArmRecvSingle(ring, fd, RECV, (uint)RECV_BUF_SZ);
                             }
-
-                            // recycle buffer
-                            byte* addr = BR_Slab + (nuint)bid * (nuint)RECV_BUF_SZ;
-                            shim_buf_ring_add(BR, addr, (uint)RECV_BUF_SZ, bid, (ushort)BR_Mask, BR_Idx++);
-                            shim_buf_ring_advance(BR, 1);
                         }
                     }
                     else if (kind == UdKind.Send)
@@ -223,32 +175,26 @@ unsafe class Program
                         var c = Conns[fd];
                         if (c is null || res <= 0)
                         {
-                            if (c is not null) Conns[fd]=null;
+                            if (c is not null) Conns[fd] = null;
                             close(fd);
                         }
                         else
                         {
                             c.OutOff += (nuint)res;
                             if (c.OutOff < c.OutLen)
-                                SubmitSend(pring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
-                            else
-                                c.Sending = false;
+                                SubmitSend(ring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
+                            // else done; keep connection for pipelined next request
                         }
                     }
 
-                    shim_cqe_seen(pring, cqe);
+                    shim_cqe_seen_h(ring, cqe);
                 }
 
-                if (shim_sq_ready(pring) > 0) shim_submit(pring);
+                if (shim_sq_ready_h(ring) > 0) shim_submit_h(ring);
             }
 
             close(lfd);
-
-            // Optional frees (process exit will clean up anyway)
-            // shim_free_buf_ring(pring, BR, (uint)BR_ENTRIES, BR_GID);
-            // NativeMemory.AlignedFree(BR_Slab);
-            // NativeMemory.Free(pprm);
-            // NativeMemory.Free(pring);
+            shim_ring_destroy(ring);
         }
     }
 
@@ -258,6 +204,7 @@ unsafe class Program
         InitOk();
 
         int workers = Math.Max(1, int.TryParse(Environment.GetEnvironmentVariable("WORKERS"), out var w) ? w : Environment.ProcessorCount);
+        workers = 16;
 
         var threads = new Thread[workers];
         for (int i = 0; i < workers; i++)
