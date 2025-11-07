@@ -1,5 +1,7 @@
+// liburingshim.c
 #define _GNU_SOURCE
 #include <liburing.h>
+#include <stdint.h>
 
 /* -------- Core ring ops -------- */
 int  shim_queue_init_params(unsigned entries, struct io_uring* ring, struct io_uring_params* p) {
@@ -14,6 +16,9 @@ void shim_cqe_seen(struct io_uring* ring, struct io_uring_cqe* cqe) { io_uring_c
 unsigned shim_sq_ready(struct io_uring* ring) { return io_uring_sq_ready(ring); }
 struct io_uring_sqe* shim_get_sqe(struct io_uring* ring) { return io_uring_get_sqe(ring); }
 
+/* Handy for debugging: fetch ring fd (check /proc/<pid>/fdinfo/<fd>) */
+int shim_ring_fd(struct io_uring* ring) { return ring->ring_fd; }
+
 /* -------- Multishot ops -------- */
 void shim_prep_multishot_accept(struct io_uring_sqe* sqe, int lfd, int flags) {
     io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL, flags);
@@ -24,6 +29,14 @@ void shim_prep_recv_multishot_select(struct io_uring_sqe* sqe, int fd, unsigned 
     sqe->buf_group = buf_group;
 }
 
+/* -------- Basic recv & send -------- */
+void shim_prep_send(struct io_uring_sqe* sqe, int fd, const void* buf, unsigned nbytes, int flags) {
+    io_uring_prep_send(sqe, fd, buf, nbytes, flags);
+}
+void shim_prep_recv(struct io_uring_sqe* sqe, int fd, void* buf, unsigned nbytes, int flags) {
+    io_uring_prep_recv(sqe, fd, buf, nbytes, flags);
+}
+
 /* -------- User-data helpers -------- */
 void shim_sqe_set_data64(struct io_uring_sqe* sqe, unsigned long long data) {
     io_uring_sqe_set_data64(sqe, data);
@@ -32,7 +45,7 @@ unsigned long long shim_cqe_get_data64(const struct io_uring_cqe* cqe) {
     return io_uring_cqe_get_data64(cqe);
 }
 
-/* -------- Buf-ring helpers (NEW SIGNATURES) -------- */
+/* -------- Buf-ring helpers -------- */
 struct io_uring_buf_ring* shim_setup_buf_ring(struct io_uring* ring,
                                               unsigned entries,
                                               unsigned bgid,
@@ -62,9 +75,4 @@ int shim_cqe_has_buffer(const struct io_uring_cqe* cqe) {
 }
 unsigned shim_cqe_buffer_id(const struct io_uring_cqe* cqe) {
     return cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-}
-
-/* -------- Send (kept from previous shim) -------- */
-void shim_prep_send(struct io_uring_sqe* sqe, int fd, const void* buf, unsigned nbytes, int flags) {
-    io_uring_prep_send(sqe, fd, buf, nbytes, flags);
 }
