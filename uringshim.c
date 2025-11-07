@@ -52,6 +52,7 @@ static pfn_free_buf_ring    p_io_uring_free_buf_ring    = NULL;
 static pfn_buf_ring_add     p_io_uring_buf_ring_add     = NULL;
 static pfn_buf_ring_advance p_io_uring_buf_ring_advance = NULL;
 
+/* single-shot recv helper (baseline path) */
 void shim_prep_recv(struct io_uring_sqe* sqe, int fd, void* buf, unsigned len, int flags)
 {
     io_uring_prep_recv(sqe, fd, buf, len, flags);
@@ -63,7 +64,6 @@ static void resolve_bufring_symbols_once(void)
     if (done) return;
     done = 1;
 
-    // RTLD_DEFAULT searches the global symbol table (works even without explicit dlopen)
     p_io_uring_setup_buf_ring   = (pfn_setup_buf_ring)   dlsym(RTLD_DEFAULT, "io_uring_setup_buf_ring");
     p_io_uring_free_buf_ring    = (pfn_free_buf_ring)    dlsym(RTLD_DEFAULT, "io_uring_free_buf_ring");
     p_io_uring_buf_ring_add     = (pfn_buf_ring_add)     dlsym(RTLD_DEFAULT, "io_uring_buf_ring_add");
@@ -74,9 +74,9 @@ static void resolve_bufring_symbols_once(void)
 
 struct RingHandle* shim_ring_create(unsigned entries, unsigned sqpoll_idle_ms, int* out_errno)
 {
-    struct io_uring_params p = {0};
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
 
-    // Respect SQPOLL=1 env var (cap_sys_admin typically required)
     const char* env = getenv("SQPOLL");
     if (env && env[0] == '1' && env[1] == '\0') {
         p.flags = IORING_SETUP_SQPOLL;
@@ -149,13 +149,18 @@ void shim_prep_multishot_accept(struct io_uring_sqe* sqe, int lfd, int flags)
     io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL, flags);
 }
 
+/* (kept for future buf-ring re-enable; unused in baseline) */
 void shim_prep_recv_multishot_select(struct io_uring_sqe* sqe, int fd, unsigned buf_group, int flags)
 {
-    // Multishot recv, with buffer-selection from group bgid
     io_uring_prep_recv_multishot(sqe, fd, NULL, 0, flags);
-    // Older liburing may lack io_uring_sqe_set_buf_group(); set fields directly:
     sqe->buf_group = (unsigned short)buf_group;
     sqe->flags    |= IOSQE_BUFFER_SELECT;
+}
+
+/* optional; we won't use it for recv/send in baseline */
+void shim_sqe_set_async(struct io_uring_sqe* sqe)
+{
+    sqe->flags |= IOSQE_ASYNC;
 }
 
 void shim_prep_send(struct io_uring_sqe* sqe, int fd, void* buf, unsigned nbytes, int flags)
@@ -175,7 +180,6 @@ unsigned long long shim_cqe_get_data64(struct io_uring_cqe* cqe)
 
 /* ===== Buf-ring wrappers (handle-based, runtime-resolved) =============== */
 
-// Returns pointer to buf-ring or NULL; *out_ret is 0 on success or -errno style on failure.
 struct io_uring_buf_ring* shim_setup_buf_ring_h(struct RingHandle* h, unsigned entries, unsigned bgid, unsigned flags, int* out_ret)
 {
     resolve_bufring_symbols_once();
@@ -194,38 +198,23 @@ struct io_uring_buf_ring* shim_setup_buf_ring_h(struct RingHandle* h, unsigned e
 void shim_free_buf_ring_h(struct RingHandle* h, struct io_uring_buf_ring* br, unsigned entries, unsigned bgid)
 {
     resolve_bufring_symbols_once();
-
-    if (!p_io_uring_free_buf_ring) {
-        // No-op if not available
-        return;
-    }
+    if (!p_io_uring_free_buf_ring) return;
     p_io_uring_free_buf_ring(&h->ring, br, entries, bgid);
 }
 
 void shim_buf_ring_add(struct io_uring_buf_ring* br, void* addr, unsigned len, unsigned short bid, unsigned short mask, unsigned idx)
 {
     resolve_bufring_symbols_once();
-
-    if (p_io_uring_buf_ring_add) {
-        p_io_uring_buf_ring_add(br, addr, len, bid, mask, idx);
-        return;
-    }
-    // Without add(): we can’t safely poke internals -> silently ignore (or you may set *out_ret upstream).
-    // Caller already feature-gates using shim_setup_buf_ring_h’s -EOPNOTSUPP.
+    if (p_io_uring_buf_ring_add) p_io_uring_buf_ring_add(br, addr, len, bid, mask, idx);
 }
 
 void shim_buf_ring_advance(struct io_uring_buf_ring* br, unsigned count)
 {
     resolve_bufring_symbols_once();
-
-    if (p_io_uring_buf_ring_advance) {
-        p_io_uring_buf_ring_advance(br, count);
-        return;
-    }
-    // See comment above.
+    if (p_io_uring_buf_ring_advance) p_io_uring_buf_ring_advance(br, count);
 }
 
-// CQE buffer helpers (older liburing compatibility)
+/* CQE buffer helpers (older liburing compatibility) */
 int shim_cqe_has_buffer(struct io_uring_cqe* cqe)
 {
     return (cqe->flags & IORING_CQE_F_BUFFER) ? 1 : 0;

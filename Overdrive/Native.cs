@@ -8,7 +8,8 @@ internal static unsafe class Native
     internal const int RING_ENTRIES = 8192;
     internal const int MAX_FD       = 200_000;
     internal const int RECV_BUF_SZ  = 8192;
-    internal const int BR_ENTRIES   = 4096;     // power-of-two
+
+    internal const int BR_ENTRIES   = 4096;     // (unused in baseline)
     internal const int BR_GID       = 1;
     internal const int BACKLOG      = 65535;
     internal const int BATCH_CQES   = 512;
@@ -32,16 +33,19 @@ internal static unsafe class Native
         internal uint  flags;
     }
 
-    internal struct io_uring_buf_ring { } // opaque pointer on native side
+    internal struct io_uring_buf_ring { } // opaque (unused in baseline)
 
-    // ---- uringshim (handle-based) ----
-    // NOTE: your .so is named liburingshim.so; "uringshim" works for DllImport on Linux.
     private const string ShimLib = "uringshim";
-    
-    [DllImport("uringshim", CallingConvention = CallingConvention.Cdecl)]
+
+    // optional (kept for accept); not used for recv/send in baseline
+    [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void shim_sqe_set_async(io_uring_sqe* sqe);
+
+    // single-shot recv helper
+    [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void shim_prep_recv(io_uring_sqe* sqe, int fd, void* buf, uint nbytes, int flags);
 
-
+    // Ring lifecycle
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern System.IntPtr shim_ring_create(uint entries, uint sqpollIdleMs, out int outErr);
 
@@ -51,6 +55,7 @@ internal static unsafe class Native
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int shim_ring_fd(System.IntPtr handle);
 
+    // SQ/CQ
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern io_uring_sqe* shim_get_sqe_h(System.IntPtr ring);
 
@@ -74,9 +79,6 @@ internal static unsafe class Native
     internal static extern void shim_prep_multishot_accept(io_uring_sqe* sqe, int lfd, int flags);
 
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern void shim_prep_recv_multishot_select(io_uring_sqe* sqe, int fd, uint buf_group, int flags);
-
-    [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void shim_prep_send(io_uring_sqe* sqe, int fd, void* buf, uint nbytes, int flags);
 
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
@@ -85,7 +87,7 @@ internal static unsafe class Native
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern ulong shim_cqe_get_data64(io_uring_cqe* cqe);
 
-    // Buf-ring
+    // (buf-ring imports kept for later experiments)
     [DllImport(ShimLib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern io_uring_buf_ring* shim_setup_buf_ring_h(System.IntPtr ring, uint entries, uint bgid, uint flags, out int ret);
 

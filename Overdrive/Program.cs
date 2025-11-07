@@ -1,8 +1,8 @@
 ﻿// Program.cs — io_uring /pp server: SQPOLL + multishot accept + single-shot recv (no buf-ring)
-// Requires: liburingshim.so on loader path (LD_LIBRARY_PATH=. or next to binary)
-// Run: SQPOLL=1 ./Overdrive   (needs CAP_SYS_ADMIN/root for SQPOLL)
+// Uses a per-connection 8 KiB unmanaged buffer (simple pool) to avoid races.
 
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -40,6 +40,7 @@ unsafe class Program
     {
         var sqe = SqeGet(ring);
         shim_prep_send(sqe, fd, buf + off, (uint)(len - off), 0);
+        // no IOSQE_ASYNC here
         shim_sqe_set_data64(sqe, PackUd(UdKind.Send, fd));
     }
 
@@ -47,8 +48,9 @@ unsafe class Program
     {
         var sqe = SqeGet(ring);
         shim_prep_recv(sqe, fd, buf, len, 0);
+        // no IOSQE_ASYNC here
         shim_sqe_set_data64(sqe, PackUd(UdKind.Recv, fd));
-        shim_submit_h(ring); // flush now
+        shim_submit_h(ring);
     }
 
     static int CreateListen(string ip, ushort port)
@@ -73,6 +75,10 @@ unsafe class Program
         public int Fd;
         public nuint OutOff, OutLen;
         public byte* OutBuf;
+
+        public byte* InBuf;   // per-connection buffer
+        public uint  InLen;
+
         public Conn(int fd) { Fd = fd; }
     }
 
@@ -84,7 +90,31 @@ unsafe class Program
         {
             Conn?[] Conns = new Conn?[MAX_FD];
 
-            // Create ring (SQPOLL honor via shim + env)
+            // ---- Simple unmanaged buffer pool (8 KiB blocks) ----
+            const int POOL_BLOCKS = 8192; // 8192 * 8 KiB ≈ 64 MiB per worker (tune)
+            byte* poolBase = (byte*)NativeMemory.AlignedAlloc((nuint)(POOL_BLOCKS * RECV_BUF_SZ), 64);
+            int   poolTop  = 0;
+            var   freeIdx  = new ConcurrentStack<int>();
+
+            byte* RentBuf()
+            {
+                if (freeIdx.TryPop(out int idx))
+                    return poolBase + (nuint)idx * (nuint)RECV_BUF_SZ;
+                int my = Interlocked.Increment(ref poolTop) - 1;
+                if (my >= POOL_BLOCKS) return null;
+                return poolBase + (nuint)my * (nuint)RECV_BUF_SZ;
+            }
+
+            void ReturnBuf(byte* p)
+            {
+                if (p == null) return;
+                long off = p - poolBase;
+                if (off < 0) return;
+                int idx = (int)(off / RECV_BUF_SZ);
+                freeIdx.Push(idx);
+            }
+
+            // ---- Create ring ----
             const uint ENTRIES = 256;
             int err;
             IntPtr ring = shim_ring_create(ENTRIES, 2000, out err);
@@ -97,13 +127,12 @@ unsafe class Program
 
             int lfd = CreateListen(ip, port);
 
-            // One worker-wide recv buffer (8 KiB)
-            byte* RECV = (byte*)NativeMemory.AlignedAlloc((nuint)RECV_BUF_SZ, 64);
-
-            // Multishot accept
+            // ---- Multishot accept ----
             {
                 var sqe = SqeGet(ring);
                 shim_prep_multishot_accept(sqe, lfd, SOCK_NONBLOCK);
+                // you can keep or remove async here; it's usually neutral
+                // shim_sqe_set_async(sqe);
                 shim_sqe_set_data64(sqe, PackUd(UdKind.Accept, lfd));
                 shim_submit_h(ring);
             }
@@ -137,36 +166,43 @@ unsafe class Program
                         {
                             int fd = res;
                             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, (uint)sizeof(int));
-                            Conns[fd] = new Conn(fd);
-                            // arm first recv for this connection immediately
-                            ArmRecvSingle(ring, fd, RECV, (uint)RECV_BUF_SZ);
+                            var c = Conns[fd]; if (c is null) Conns[fd] = c = new Conn(fd);
+
+                            c.OutBuf = null; c.OutOff = 0; c.OutLen = 0;
+
+                            c.InBuf = RentBuf();
+                            if (c.InBuf == null) { Conns[fd] = null; close(fd); continue; }
+                            c.InLen = (uint)RECV_BUF_SZ;
+
+                            // arm first recv immediately, using per-conn buffer
+                            ArmRecvSingle(ring, fd, c.InBuf, c.InLen);
                         }
                     }
                     else if (kind == UdKind.Recv)
                     {
                         int fd = UdFdOf(ud);
-                        if (res <= 0)
+                        var c = Conns[fd];
+
+                        if (res <= 0 || c is null)
                         {
-                            if (Conns[fd] is not null) Conns[fd] = null;
+                            if (c is not null) { ReturnBuf(c.InBuf); Conns[fd] = null; }
                             close(fd);
                         }
                         else
                         {
-                            var c = Conns[fd];
-                            if (c is not null)
+                            var basePtr = c.InBuf;
+                            int usedTotal = 0;
+                            while (true)
                             {
-                                int usedTotal = 0;
-                                while (true)
-                                {
-                                    int used = ParseOne(RECV + usedTotal, res - usedTotal);
-                                    if (used <= 0) break;
-                                    usedTotal += used;
-                                    c.OutBuf = OK_PTR; c.OutLen = OK_LEN; c.OutOff = 0;
-                                    SubmitSend(ring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
-                                }
-                                // re-arm recv for next request(s)
-                                ArmRecvSingle(ring, fd, RECV, (uint)RECV_BUF_SZ);
+                                int used = ParseOne(basePtr + usedTotal, res - usedTotal);
+                                if (used <= 0) break;
+                                usedTotal += used;
+                                c.OutBuf = OK_PTR; c.OutLen = OK_LEN; c.OutOff = 0;
+                                SubmitSend(ring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
                             }
+
+                            // re-arm recv for more pipelined requests on same connection
+                            ArmRecvSingle(ring, fd, c.InBuf, c.InLen);
                         }
                     }
                     else if (kind == UdKind.Send)
@@ -175,7 +211,7 @@ unsafe class Program
                         var c = Conns[fd];
                         if (c is null || res <= 0)
                         {
-                            if (c is not null) Conns[fd] = null;
+                            if (c is not null) { ReturnBuf(c.InBuf); Conns[fd] = null; }
                             close(fd);
                         }
                         else
@@ -183,7 +219,7 @@ unsafe class Program
                             c.OutOff += (nuint)res;
                             if (c.OutOff < c.OutLen)
                                 SubmitSend(ring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
-                            // else done; keep connection for pipelined next request
+                            // else keep-alive; next recv already armed
                         }
                     }
 
@@ -195,6 +231,7 @@ unsafe class Program
 
             close(lfd);
             shim_ring_destroy(ring);
+            // Optional: free poolBase via NativeMemory.AlignedFree(poolBase);
         }
     }
 
