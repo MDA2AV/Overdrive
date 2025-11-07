@@ -258,7 +258,7 @@ unsafe class Program
         InitOk();
 
         int workers = Math.Max(1, int.TryParse(Environment.GetEnvironmentVariable("WORKERS"), out var w) ? w : Environment.ProcessorCount);
-
+        workers = 16;
         var threads = new Thread[workers];
         for (int i = 0; i < workers; i++)
         {
