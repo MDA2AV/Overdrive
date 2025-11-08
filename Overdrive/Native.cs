@@ -18,21 +18,30 @@ internal static unsafe class Native
     internal const ushort LISTEN_PORT = 8080;
 
     // ---- liburing interop ----
-    [StructLayout(LayoutKind.Sequential)] internal struct io_uring { public fixed ulong _[128]; }
-    [StructLayout(LayoutKind.Sequential)] internal struct io_uring_params
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct io_uring
     {
-        public uint sq_entries, cq_entries, flags, sq_thread_cpu, sq_thread_idle;
-        public fixed uint features[1];
-        public fixed uint resv[4];
-        public fixed ulong sq_off[7];
-        public fixed ulong cq_off[7];
+        public fixed ulong _[128]; 
+    } // opaque enough
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct io_uring_sqe
+    {
+        public fixed ulong _[8]; 
     }
-    [StructLayout(LayoutKind.Sequential)] internal struct io_uring_sqe { public fixed ulong _[8]; }
-    [StructLayout(LayoutKind.Sequential)] internal struct io_uring_cqe { public ulong user_data; public int res; public uint flags; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct io_uring_cqe
+    {
+        public ulong user_data; public int res; public uint flags; 
+    }
     internal struct io_uring_buf_ring { } // opaque
 
-    // shim API (all liburing calls go through liburingshim.so)
-    [DllImport("uringshim")] internal static extern int  shim_queue_init_params(uint entries, io_uring* ring, io_uring_params* p);
+    // ---- NEW: ring lifecycle in the shim ----
+    [DllImport("uringshim")] internal static extern io_uring* shim_create_ring(uint entries, out int err);
+    [DllImport("uringshim")] internal static extern void      shim_destroy_ring(io_uring* ring);
+
+    // ---- queue ops ----
     [DllImport("uringshim")] internal static extern io_uring_sqe* shim_get_sqe(io_uring* ring);
     [DllImport("uringshim")] internal static extern int  shim_submit(io_uring* ring);
     [DllImport("uringshim")] internal static extern int  shim_wait_cqe(io_uring* ring, io_uring_cqe** cqe);
@@ -40,13 +49,16 @@ internal static unsafe class Native
     [DllImport("uringshim")] internal static extern void shim_cqe_seen(io_uring* ring, io_uring_cqe* cqe);
     [DllImport("uringshim")] internal static extern uint shim_sq_ready(io_uring* ring);
 
+    // ---- ops ----
     [DllImport("uringshim")] internal static extern void shim_prep_multishot_accept(io_uring_sqe* sqe, int lfd, int flags);
     [DllImport("uringshim")] internal static extern void shim_prep_recv_multishot_select(io_uring_sqe* sqe, int fd, uint buf_group, int flags);
     [DllImport("uringshim")] internal static extern void shim_prep_send(io_uring_sqe* sqe, int fd, void* buf, uint nbytes, int flags);
 
+    // ---- userdata helpers ----
     [DllImport("uringshim")] internal static extern void   shim_sqe_set_data64(io_uring_sqe* sqe, ulong data);
     [DllImport("uringshim")] internal static extern ulong  shim_cqe_get_data64(io_uring_cqe* cqe);
 
+    // ---- buf-ring helpers ----
     [DllImport("uringshim")] internal static extern io_uring_buf_ring* shim_setup_buf_ring(io_uring* ring, uint entries, uint bgid, uint flags, out int ret);
     [DllImport("uringshim")] internal static extern void shim_free_buf_ring(io_uring* ring, io_uring_buf_ring* br, uint entries, uint bgid);
     [DllImport("uringshim")] internal static extern void shim_buf_ring_add(io_uring_buf_ring* br, void* addr, uint len, ushort bid, ushort mask, uint idx);
@@ -81,4 +93,20 @@ internal static unsafe class Native
     internal static ulong  PackUd(UdKind k, int fd) => ((ulong)k<<32) | (uint)fd;
     internal static UdKind UdKindOf(ulong ud) => (UdKind)(ud>>32);
     internal static int    UdFdOf(ulong ud)   => (int)(ud & 0xffffffff);
+    
+    // ---- Affinity (optional; left here but not used) ----
+    internal static class Affinity
+    {
+        const long SYS_gettid = 186;
+        [DllImport("libc")] static extern long syscall(long n);
+        [DllImport("libc")] static extern int sched_setaffinity(int pid, nuint cpusetsize, byte[] mask);
+        public static void PinCurrentThreadToCpu(int cpu)
+        {
+            int tid = (int)syscall(SYS_gettid);
+            int bytes = (Environment.ProcessorCount + 7) / 8;
+            var mask = new byte[Math.Max(bytes, 8)];
+            mask[cpu / 8] |= (byte)(1 << (cpu % 8));
+            _ = sched_setaffinity(tid, (nuint)mask.Length, mask);
+        }
+    }
 }
