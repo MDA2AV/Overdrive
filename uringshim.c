@@ -226,3 +226,7 @@ void shim_prep_send(struct io_uring_sqe* sqe,
 {
     io_uring_prep_send(sqe, fd, buf, nbytes, flags);
 }
+
+int shim_wait_cqe_timeout(struct io_uring *ring, struct io_uring_cqe **cqe_ptr, struct __kernel_timespec *ts) {
+    return io_uring_wait_cqe_timeout(ring, cqe_ptr, ts);
+}

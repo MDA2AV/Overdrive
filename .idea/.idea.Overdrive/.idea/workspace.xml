@@ -11,6 +11,8 @@
       <change beforePath="$PROJECT_DIR$/.idea/.idea.Overdrive/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/.idea.Overdrive/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Overdrive/Native.cs" beforeDir="false" afterPath="$PROJECT_DIR$/Overdrive/Native.cs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Overdrive/Program.cs" beforeDir="false" afterPath="$PROJECT_DIR$/Overdrive/Program.cs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/liburingshim.so" beforeDir="false" afterPath="$PROJECT_DIR$/liburingshim.so" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/uringshim.c" beforeDir="false" afterPath="$PROJECT_DIR$/uringshim.c" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
