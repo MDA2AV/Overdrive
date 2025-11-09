@@ -21,19 +21,21 @@ internal static unsafe class Native
     [StructLayout(LayoutKind.Sequential)]
     internal struct io_uring
     {
-        public fixed ulong _[128]; 
+        internal fixed ulong _[128]; 
     } // opaque enough
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct io_uring_sqe
     {
-        public fixed ulong _[8]; 
+        internal fixed ulong _[8]; 
     }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct io_uring_cqe
     {
-        public ulong user_data; public int res; public uint flags; 
+        internal ulong user_data; 
+        internal int res; 
+        internal uint flags; 
     }
     internal struct io_uring_buf_ring { } // opaque
 
@@ -75,11 +77,25 @@ internal static unsafe class Native
     [DllImport("libc")] internal static extern int close(int fd);
     [DllImport("libc")] internal static extern int inet_pton(int af, sbyte* src, void* dst);
 
-    internal const int AF_INET=2, SOCK_STREAM=1, SOL_SOCKET=1, SO_REUSEADDR=2, SO_REUSEPORT=15;
-    internal const int IPPROTO_TCP=6, TCP_NODELAY=1;
-    internal const int F_GETFL=3, F_SETFL=4, O_NONBLOCK=0x800, SOCK_NONBLOCK=0x800;
+    internal const int  AF_INET=2, 
+                        SOCK_STREAM=1, 
+                        SOL_SOCKET=1, 
+                        SO_REUSEADDR=2, 
+                        SO_REUSEPORT=15;
+    
+    internal const int  IPPROTO_TCP=6, 
+                        TCP_NODELAY=1;
+    
+    internal const int  F_GETFL=3, 
+                        F_SETFL=4, 
+                        O_NONBLOCK=0x800, 
+                        SOCK_NONBLOCK=0x800;
 
-    [StructLayout(LayoutKind.Sequential)] internal struct in_addr { public uint s_addr; }
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct in_addr
+    {
+        public uint s_addr; 
+    }
     [StructLayout(LayoutKind.Sequential)] internal struct sockaddr_in
     {
         public ushort sin_family;
@@ -89,7 +105,12 @@ internal static unsafe class Native
     }
     internal static ushort Htons(ushort x) => (ushort)((x<<8)|(x>>8));
 
-    internal enum UdKind : uint { Accept=1, Recv=2, Send=3 }
+    internal enum UdKind : uint
+    {
+        Accept=1, 
+        Recv=2, 
+        Send=3 
+    }
     internal static ulong  PackUd(UdKind k, int fd) => ((ulong)k<<32) | (uint)fd;
     internal static UdKind UdKindOf(ulong ud) => (UdKind)(ud>>32);
     internal static int    UdFdOf(ulong ud)   => (int)(ud & 0xffffffff);

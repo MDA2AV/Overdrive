@@ -75,7 +75,7 @@ unsafe class Program
         return lfd;
     }
 
-    sealed class Conn
+    internal sealed class Conn
     {
         public int Fd;
         public bool Sending;
@@ -148,25 +148,52 @@ unsafe class Program
                 shim_sqe_set_data64(sqe, PackUd(UdKind.Accept, lfd));
                 shim_submit(pring);
             }
-
-            var cqes = new io_uring_cqe*[BATCH_CQES];
+            
+            // TODO: Consider using a marshall unmanaged pinned array here?
+            var cqes = new io_uring_cqe*[BATCH_CQES]; // Array of native pointers to CQE
             int one = 1;
 
             while (!StopAll)
             {
                 int got;
-                fixed (io_uring_cqe** pC = cqes)
-                    got = shim_peek_batch_cqe(pring, pC, (uint)BATCH_CQES);
+                fixed (io_uring_cqe** pC = cqes)      // Pointer to array of pointers to CQE
+                    got = shim_peek_batch_cqe(pring, pC, (uint)BATCH_CQES); // tries to read up to BATCH_CQES completion events from the ring without blocking
 
-                if (got <= 0)
+                /*This block runs when peek_batch_cqe() found no ready completion events (got <= 0).
+                 * In that case, we need to wait for the next event, so we declare a local pointer
+                 * variable oneCqe which will hold a pointer to a CQE stored inside the ring.
+                 * We then call shim_wait_cqe(pring, &oneCqe), passing the address of that pointer variable,
+                 * which allows the kernel to write the actual CQE pointer into it. If shim_wait_cqe returns non-zero,
+                 * we skip this loop iteration. Otherwise, we store the returned CQE pointer into cqes[0] and set got = 1,
+                 * so the rest of the event-processing loop can handle it exactly the same way as a batched completion.
+                 * This ensures a smooth transition between the fast path (batch peek) and the slow path (blocking wait),
+                 * while keeping downstream logic uniform.*/
+                if (got <= 0) // Found 0 CQEs, no events are ready right now
                 {
+                    
+                    // Declare a pointer variable that will receive the CQE pointer.
+                    // The CQE itself is stored inside the ring; we only receive a pointer to it.
                     io_uring_cqe* oneCqe = null;
-                    if (shim_wait_cqe(pring, &oneCqe) != 0) continue;
-                    cqes[0] = oneCqe; got = 1;
+                    
+                    if (shim_wait_cqe(pring, &oneCqe) != 0) // & oneCqe is not a pointer to a pointer, io_uring_cqe**
+                        continue;
+                    
+                    cqes[0] = oneCqe; 
+                    got = 1;
                 }
-
+                
+                // For each completion event that we have ready to handle, process it.
                 for (int i = 0; i < got; i++)
                 {
+                    /*cqe is the pointer to the i-th completion event we’re handling.
+                       shim_cqe_get_data64(cqe) retrieves the 64-bit user-data value we attached when we originally submitted the operation.
+                       We encoded both what kind of operation it was (Accept / Recv / Send) and which socket fd it belongs to inside that user-data.
+                       
+                       UdKindOf(ud) extracts the operation type from that bit-packed value — so we know which handler to run.
+                       cqe->res is the result of the syscall, meaning:
+                        - For Accept: the return value is the new client file descriptor, or negative if error.
+                        - For Recv: it’s number of bytes received, or 0 / <0 on disconnect/error.
+                        - For Send: it’s number of bytes written, or <=0 if sending failed.*/
                     var cqe = cqes[i];
                     ulong ud = shim_cqe_get_data64(cqe);
                     var kind = UdKindOf(ud);
@@ -184,7 +211,11 @@ unsafe class Program
                             if (c is null) 
                                 Conns[fd] = c = new Conn(fd);
                             
-                            c.Sending = false; c.OutBuf = null; c.OutOff = 0; c.OutLen = 0;
+                            c.Sending = false; 
+                            c.OutBuf = null; 
+                            c.OutOff = 0; 
+                            c.OutLen = 0;
+                            
                             ArmRecvMultishot(pring, fd, BR_GID);
                         }
                     }
@@ -194,7 +225,11 @@ unsafe class Program
                         if (res <= 0)
                         {
                             var c = Conns[fd];
-                            if (c is not null) { Conns[fd] = null; close(fd); }
+                            if (c is not null)
+                            {
+                                Conns[fd] = null; 
+                                close(fd); 
+                            }
                         }
                         else
                         {
@@ -211,7 +246,11 @@ unsafe class Program
                                     int used = ParseOne(basePtr + usedTotal, res - usedTotal);
                                     if (used <= 0) break;
                                     usedTotal += used;
-                                    c.OutBuf = OK_PTR; c.OutLen = OK_LEN; c.OutOff = 0;
+                                    
+                                    c.OutBuf = OK_PTR; 
+                                    c.OutLen = OK_LEN; 
+                                    c.OutOff = 0;
+                                    
                                     SubmitSend(pring, c.Fd, c.OutBuf, c.OutOff, c.OutLen);
                                 }
                             }
