@@ -1,3 +1,5 @@
+#--security-opt seccomp=unconfined
+
 # ---- Build (musl) --------------------------------------------------------
 FROM mcr.microsoft.com/dotnet/sdk:9.0-alpine AS build
 # toolchain + liburing headers for musl

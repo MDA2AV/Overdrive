@@ -6,6 +6,15 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+        <ServerGarbageCollection>true</ServerGarbageCollection>
+        
+        <TieredPGO>true</TieredPGO>
+        <SelfContained>true</SelfContained>
     </PropertyGroup>
 
+    <ItemGroup Condition="$(PublishAot) == 'true'">
+        <RuntimeHostConfigurationOption Include="System.Threading.ThreadPool.HillClimbing.Disable" Value="true" />
+    </ItemGroup>
+    
 </Project>
