@@ -10,7 +10,7 @@ public sealed unsafe partial class OverdriveEngine
     private static int s_recvBufferSize  = 32 * 1024;
     private static int s_bufferRingEntries   = 16 * 1024;     // power-of-two
     private static int s_backlog      = 65535;
-    private static int s_batchCQES   = 512;
+    private static int s_batchCQES   = 4096;
     private static int s_nWorkers;
     
     private static ushort s_port = 8080;
