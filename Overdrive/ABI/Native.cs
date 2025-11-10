@@ -1,21 +1,15 @@
 using System.Runtime.InteropServices;
 
-namespace Overdrive;
+namespace Overdrive.ABI;
 
 internal static unsafe class Native
 {
-    // ---- Tunables ----
-    internal const int RING_ENTRIES = 8192;
-    internal const int MAX_FD       = 200_000;
-    internal const int RECV_BUF_SZ  = 8192;
-    internal const int BR_ENTRIES   = 4096;     // power-of-two
-    internal const int BR_GID       = 1;
-    internal const int BACKLOG      = 65535;
-    internal const int BATCH_CQES   = 512;
-
-    // Fixed IP/Port
-    internal const string LISTEN_IP   = "0.0.0.0";
-    internal const ushort LISTEN_PORT = 8080;
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct __kernel_timespec
+    {
+        public long tv_sec;   // seconds
+        public long tv_nsec;  // nanoseconds
+    }
 
     // ---- liburing interop ----
     [StructLayout(LayoutKind.Sequential)]
@@ -67,6 +61,7 @@ internal static unsafe class Native
     [DllImport("uringshim")] internal static extern void shim_buf_ring_advance(io_uring_buf_ring* br, uint count);
     [DllImport("uringshim")] internal static extern int  shim_cqe_has_buffer(io_uring_cqe* cqe);
     [DllImport("uringshim")] internal static extern uint shim_cqe_buffer_id(io_uring_cqe* cqe);
+    [DllImport("uringshim")] internal static extern int shim_wait_cqe_timeout(io_uring* ring, io_uring_cqe** cqe, __kernel_timespec* ts);
 
     // libc
     [DllImport("libc")] internal static extern int socket(int domain, int type, int proto);
