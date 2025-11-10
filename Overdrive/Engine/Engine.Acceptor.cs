@@ -10,7 +10,9 @@ public sealed unsafe partial class OverdriveEngine
     public static void AcceptorLoop(string ip, ushort port, int workerCount)
     {
         int lfd = CreateListen(ip, port);
+        
         io_uring* pring = null;
+        
         try
         {
             Console.WriteLine($"[acceptor] Listening on {ip}:{port}");
@@ -186,13 +188,4 @@ public sealed unsafe partial class OverdriveEngine
 
         return lfd;
     }
-    
-    private static volatile bool StopAll = false;
-
-    // Lock-free queues for passing accepted fds to workers
-    private static ConcurrentQueue<int>[] WorkerQueues = null!;
-
-    // Stats tracking
-    private static long[] WorkerConnectionCounts = null!;
-    private static long[] WorkerRequestCounts = null!;
 }
