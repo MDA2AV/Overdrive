@@ -1,28 +1,15 @@
 using System.Runtime.InteropServices;
 
-namespace Overdrive;
+namespace Overdrive.ABI;
 
 internal static unsafe class Native
 {
-    // ---- Tunables ----
-    internal const int RING_ENTRIES = 8192;
-    internal const int MAX_FD       = 200_000;
-    internal const int RECV_BUF_SZ  = 8192;
-    internal const int BR_ENTRIES   = 4096;     // power-of-two
-    internal const int BR_GID       = 1;
-    internal const int BACKLOG      = 65535;
-    internal const int BATCH_CQES   = 512;
-    
     [StructLayout(LayoutKind.Sequential)]
     internal struct __kernel_timespec
     {
         public long tv_sec;   // seconds
         public long tv_nsec;  // nanoseconds
     }
-
-    // Fixed IP/Port
-    internal const string LISTEN_IP   = "0.0.0.0";
-    internal const ushort LISTEN_PORT = 8080;
 
     // ---- liburing interop ----
     [StructLayout(LayoutKind.Sequential)]
