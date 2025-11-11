@@ -11,13 +11,14 @@ WORKDIR /src
 # adjust paths if yours differ
 COPY uringshim.c ./native/
 COPY /Overdrive/ ./Overdrive/
+COPY /Overdrive.Playground/ ./Overdrive.Playground/
 
 # build liburingshim.so against musl's liburing
 WORKDIR /src/native
 RUN clang -O2 -fPIC -shared uringshim.c -o liburingshim.so -luring -ldl
 
 # publish your NativeAOT app for linux-musl-x64
-WORKDIR /src/Overdrive
+WORKDIR /src/Overdrive.Playground
 RUN dotnet publish -c Release \
     -r linux-musl-x64 \
     --self-contained true \
@@ -42,6 +43,6 @@ WORKDIR /app
 COPY --from=build /app/out ./
 
 # If your binary is named 'Platform' (as in your example)
-RUN chmod +x ./Overdrive
+RUN chmod +x ./Overdrive.Playground
 EXPOSE 8080
-ENTRYPOINT ["./Overdrive"]
+ENTRYPOINT ["./Overdrive.Playground"]

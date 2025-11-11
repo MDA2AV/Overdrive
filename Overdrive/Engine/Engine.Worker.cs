@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.ObjectPool;
-using Overdrive.ABI;
 using Overdrive.HttpProtocol;
 using static Overdrive.ABI.Native;
 
@@ -31,19 +30,16 @@ public sealed unsafe partial class OverdriveEngine
             return true;
         }
     }
-    
-    public static void WorkerLoop(int workerIndex)
-    {
-        //Connection?[] Conns = new Connection?[MAX_FD];
 
+    private static void WorkerLoop(int workerIndex)
+    {
         var connections = new Dictionary<int, Connection>(capacity: 1024);
         
-        Native.io_uring* pring = null;
+        io_uring* pring = null;
 
         // Buffer-ring resources to ensure we always free them
-        Native.io_uring_buf_ring* BR = null;
+        io_uring_buf_ring* BR = null;
         byte* BR_Slab = null;
-        uint BR_Mask = 0;
         uint BR_Idx = 0;
 
         try
@@ -56,6 +52,7 @@ public sealed unsafe partial class OverdriveEngine
             }
 
             // Setup buffer ring
+            uint BR_Mask;
             {
                 BR = shim_setup_buf_ring(pring, (uint)s_bufferRingEntries, c_bufferRingGID, 0, out var ret);
                 if (BR == null || ret < 0)
@@ -73,11 +70,9 @@ public sealed unsafe partial class OverdriveEngine
                 shim_buf_ring_advance(BR, (uint)s_bufferRingEntries);
             }
 
-            var cqes = new Native.io_uring_cqe*[s_batchCQES];
+            var cqes = new io_uring_cqe*[s_batchCQES];
             int connCount = 0;
             var myQueue = WorkerQueues[workerIndex];
-            //long processedReqs = 0;
-            //int newFdsProcessed = 0;
 
             Console.WriteLine($"[w{workerIndex}] Started and ready");
 
@@ -92,25 +87,16 @@ public sealed unsafe partial class OverdriveEngine
                     ArmRecvMultishot(pring, newFd, c_bufferRingGID);
                     connCount++;
                     newFds++;
-                    
-                    //newFdsProcessed++;
                 }
 
                 if (newFds > 0)
                 {
                     shim_submit(pring);
-                    /*if (newFdsProcessed % 1000 == 0)
-                    {
-                        Console.WriteLine($"[w{workerIndex}] Processed {newFdsProcessed} new connections, active: {connCount}, requests: {processedReqs}");
-                    }*/
                 }
-
-                // Update global stats
-                //Interlocked.Exchange(ref WorkerRequestCounts[workerIndex], processedReqs);
 
                 // Process completions
                 int got;
-                fixed (Native.io_uring_cqe** pC = cqes)
+                fixed (io_uring_cqe** pC = cqes)
                     got = shim_peek_batch_cqe(pring, pC, (uint)s_batchCQES);
 
                 if (got <= 0)
@@ -121,7 +107,7 @@ public sealed unsafe partial class OverdriveEngine
                         continue;
                     }
 
-                    Native.io_uring_cqe* oneCqe = null;
+                    io_uring_cqe* oneCqe = null;
                     if (shim_wait_cqe(pring, &oneCqe) != 0)
                         continue;
 
@@ -136,7 +122,7 @@ public sealed unsafe partial class OverdriveEngine
                     var kind = UdKindOf(ud);
                     int res = cqe->res;
 
-                    if (kind == Native.UdKind.Recv)
+                    if (kind == UdKind.Recv)
                     {
                         int fd = UdFdOf(ud);
                         ushort bid = 0;
@@ -203,7 +189,7 @@ public sealed unsafe partial class OverdriveEngine
                             shim_buf_ring_advance(BR, 1);
                         }
                     }
-                    else if (kind == Native.UdKind.Send)
+                    else if (kind == UdKind.Send)
                     {
                         int fd = UdFdOf(ud);
 
@@ -228,10 +214,21 @@ public sealed unsafe partial class OverdriveEngine
             // Close any remaining connections
             CloseAll(connections);
 
-            // Tear down ring first (unregisters resources)
-            if (pring != null) shim_destroy_ring(pring);
+            // Free buffer ring BEFORE destroying the ring
+            if (pring != null && BR != null)
+            {
+                shim_free_buf_ring(pring, BR, (uint)s_bufferRingEntries, c_bufferRingGID);
+                BR = null;
+            }
 
-            // Free the slab we allocated
+            // Destroy ring (unregisters CQ/SQ memory mappings)
+            if (pring != null)
+            {
+                shim_destroy_ring(pring);
+                pring = null;
+            }
+
+            // Free slab memory used by buf ring
             if (BR_Slab != null)
             {
                 NativeMemory.AlignedFree(BR_Slab);
@@ -248,9 +245,13 @@ public sealed unsafe partial class OverdriveEngine
         {
             try
             {
-                close(connection.Value.Fd); 
+                close(connection.Value.Fd);
                 ConnectionPool.Return(connection.Value);
-            } catch { /* ignore */ }
+            }
+            catch
+            {
+                /* ignore */ 
+            }
         }
     }
 }
