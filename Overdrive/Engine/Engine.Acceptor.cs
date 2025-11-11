@@ -135,14 +135,6 @@ public sealed unsafe partial class OverdriveEngine
         }
     }
 
-    private static int ParseOne(byte* pbuf, int len)
-    {
-        for (int i = 3; i < len; i++)
-            if (pbuf[i - 3] == '\r' && pbuf[i - 2] == '\n' && pbuf[i - 1] == '\r' && pbuf[i] == '\n')
-                return i + 1;
-        return 0;
-    }
-
     private static io_uring_sqe* SqeGet(io_uring* pring)
     {
         var sqe = shim_get_sqe(pring);
