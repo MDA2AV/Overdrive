@@ -1,6 +1,8 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.ObjectPool;
 using Overdrive.HttpProtocol;
+using Overdrive.Utilities;
 using static Overdrive.ABI.Native;
 
 namespace Overdrive.Engine;
@@ -30,7 +32,29 @@ public sealed unsafe partial class OverdriveEngine
             return true;
         }
     }
+    
+    public sealed class BufferSegment : ReadOnlySequenceSegment<byte>
+    {
+        public int Bid; // buf-ring id (so you can return it)
+        public BufferSegment(ReadOnlyMemory<byte> mem, int bid) { Memory = mem; Bid = bid; }
 
+        public BufferSegment Append(ReadOnlyMemory<byte> mem, int bid)
+        {
+            var next = new BufferSegment(mem, bid)
+            {
+                RunningIndex = RunningIndex + Memory.Length
+            };
+            Next = next;
+            return next;
+        }
+    }
+
+    private ReadOnlyMemory<byte> Wrap(byte* ptr, int len)
+    {
+        // Use your own UnmanagedMemoryManager to avoid copying:
+        return new UnmanagedMemoryManager(ptr, len).Memory;
+    }
+    
     private static void WorkerLoop(int workerIndex)
     {
         var connections = new Dictionary<int, Connection>(capacity: 1024);
@@ -79,20 +103,21 @@ public sealed unsafe partial class OverdriveEngine
             while (!StopAll)
             {
                 // Drain new connections
-                int newFds = 0;
+                //int newFds = 0;
                 while (myQueue.TryDequeue(out int newFd))
                 {
                     connections[newFd] = ConnectionPool.Get().SetFd(newFd);
 
                     ArmRecvMultishot(pring, newFd, c_bufferRingGID);
+                    shim_submit(pring);
                     connCount++;
-                    newFds++;
+                    //newFds++;
                 }
 
-                if (newFds > 0)
+                /*if (newFds > 0)
                 {
                     shim_submit(pring);
-                }
+                }*/
 
                 // Process completions
                 int got;
@@ -158,20 +183,46 @@ public sealed unsafe partial class OverdriveEngine
 
                             if (connections.TryGetValue(fd, out var connection))
                             {
+                                /* @Here: A CQE was received
+                                 *
+                                 * What to do:
+                                 * Try hot path first:
+                                 * ------------------------------------ Hot Path ---------------------------------------------
+                                 * If the connection currently holds no buffer segment, check if received ring buffer contains a full request (single segment hot path)
+                                 * If yes:
+                                 *  - Extract the request data and handle the request
+                                 *  - Advance current (single) ring buffer
+                                 *  - Mark flag that there is data to flush
+                                 *  - Try again to read + handle a request (check directly whether there's still data in the buffer after being advanced)
+                                 *    if there is no data left just break the loop
+                                 *
+                                 * If no:
+                                 * We are at a segmented request data scenario, store the ring as a buffer segment, break the loop
+                                 *
+                                 * ------------------------------------ Segmented Slow Path-----------------------------------
+                                 * This can be determined from one factor:
+                                 *  - The connection already holds at least one buffer segment
+                                 *  -
+                                 *
+                                 *
+                                 * - AT THE END RETURN ALL THE RING BUFFERS THAT CAN BE RETURNED!!
+                                 * - CONSIDER RETURNING THE RINGS AFTER PROCESSING ALL CQES!
+                                 */
                                 //int usedTotal = 0;
-                                while (true) // TODO: THis loop makes no sense
+                                int idx = 0;
+                                while (true)
                                 {
                                     //int used = ParseOne(basePtr + usedTotal, res - usedTotal);
-                                    int used = HeaderParser.FindCrlfCrlf(basePtr, 0, res);
-                                    if (used <= 0) break;
-                                    //usedTotal += used;
+                                    var headerSpan = HeaderParser.FindCrlfCrlf(basePtr, 0, res, ref idx);
+                                    
+                                    if (idx == -1) 
+                                        break;
 
                                     connection.OutPtr = OK_PTR;
                                     connection.OutTail = OK_LEN;
                                     connection.OutHead = 0;
 
                                     SubmitSend(pring, connection.Fd, connection.OutPtr, connection.OutHead, connection.OutTail);
-                                    //processedReqs++;
 
                                     break;
                                 }
